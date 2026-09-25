@@ -8,6 +8,8 @@
 | Patched modules | `/lib/modules/<kver>/updates/dkms/` |
 | Rebuild hook | `/etc/kernel/postinst.d/zz-nvidia-p2p` |
 | Rebuild log | `/var/log/nvidia-p2p-rebuild.log` |
+| Health check | `~/check-nvidia-p2p` (copy in `ops/`) |
+| Kuma push monitor | `~/scripts/p2p_kuma_push.sh`, config in `~/.config/p2p_kuma.env` |
 | RM blob | `<tree>/src/nvidia/_out/Linux_x86_64/nv-kernel.o` (17.6 MB) |
 
 ## Is P2P actually on?
@@ -88,24 +90,55 @@ Manual procedure when the driver version moves:
 4. Confirm ~33 MB, install, `depmod`, reboot, re-check `topo -p2p rw`.
 5. Point `SRC=` in the hook at the new tree and update this document.
 
-### Recommended: stop the upgrade from being a surprise
+### Upgrade protection (applied 2026-09-25)
 
-Not yet applied. Both are one-liners and they are complementary:
+Two complementary measures, both in force.
+
+**Holds.** Sixteen packages, not three. The module and `libcuda.so` are a
+matched pair, and `libcuda.so` ships in `libnvidia-compute-595`. Holding only
+`nvidia-dkms/driver/kernel-common` would let userspace move on its own and
+reproduce the 2026-09-11 mismatch from the other side:
 
 ```sh
-sudo apt-mark hold nvidia-dkms-595-open nvidia-driver-595-open nvidia-kernel-common-595
+sudo apt-mark hold \
+  nvidia-dkms-595-open nvidia-driver-595-open nvidia-kernel-common-595 \
+  nvidia-kernel-source-595-open nvidia-compute-utils-595 nvidia-utils-595 \
+  nvidia-firmware-595-595.91.07 \
+  libnvidia-compute-595 libnvidia-cfg1-595 libnvidia-common-595 \
+  libnvidia-decode-595 libnvidia-encode-595 libnvidia-extra-595 \
+  libnvidia-fbc1-595 libnvidia-gl-595 \
+  xserver-xorg-video-nvidia-595
 ```
 
-and in `/etc/apt/apt.conf.d/50unattended-upgrades`:
+**Blacklist**, in `/etc/apt/apt.conf.d/50unattended-upgrades`, as the backstop
+for a manual `dist-upgrade` that overrides holds:
 
 ```
 Unattended-Upgrade::Package-Blacklist {
-    "nvidia-.*-595.*";
+    "^nvidia-";
+    "^libnvidia-";
+    "^xserver-xorg-video-nvidia";
 };
 ```
 
-The hold makes the version bump a deliberate act. The blacklist is the backstop
-for a manual `dist-upgrade` that overrides holds.
+Verified rather than assumed:
+
+```
+$ sudo unattended-upgrade --dry-run --debug | grep -i blacklist
+Initial blacklist: ^nvidia- ^libnvidia- ^xserver-xorg-video-nvidia
+Applying pinning: PkgPin(pkg='/^^nvidia-/', priority=-32768)
+
+$ apt-get -s upgrade | grep -E '^Inst (nvidia|libnvidia)-...595'
+(no matches - driver stack untouched)
+```
+
+Releasing a hold is the deliberate act that must precede porting the patch:
+`sudo apt-mark unhold <pkg>`.
+
+**Still unheld: `dkms` itself.** A manual `apt upgrade` would move it from
+`3.4.1` to `3.4.3`. It does not touch the loaded module, but DKMS is the
+mechanism that overwrites patched modules with stock ones, so a behaviour
+change there matters here. Left unheld because other packages depend on it.
 
 A hook on driver package upgrades was considered and rejected: dpkg trigger
 ordering between DKMS and a custom hook is not guaranteed, so it would race
