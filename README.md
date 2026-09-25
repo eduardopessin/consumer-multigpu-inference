@@ -11,10 +11,13 @@ This repository documents the driver patch that enables the BAR1 route, the
 operational glue that keeps it in place across kernel and driver upgrades, and
 the evidence that it is active.
 
-Enabling P2P was observed to speed up tensor-parallel serving on this machine.
-That observation is not yet backed by a published measurement: a controlled
-P2P-on versus P2P-off comparison is pending and will be added here when it is
-run. Treat the speedup as reported, not demonstrated.
+A P2P-on versus P2P-off comparison was run as a 2x2 factorial against
+`--async-scheduling`. The fastest configuration measured is P2P on with async
+scheduling on, at 56.54 ms ITL/step under four-way concurrency against 65.65 ms
+with async scheduling off. Single-stream decode shows no measurable P2P effect,
+which the message-size arithmetic predicts. See
+[`docs/performance.md`](docs/performance.md) for the full table, the noise in
+the `concurrent4` cells, and what remains unresolved.
 
 ## Current state
 
