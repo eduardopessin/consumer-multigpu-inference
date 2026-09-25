@@ -1,0 +1,1206 @@
+From e4f213984db2bc9b21b6268b62bb24a3386e1038 Mon Sep 17 00:00:00 2001
+From: FoundingEngineer <founding-engineer@privacywindow.app>
+Date: Fri, 25 Sep 2026 17:46:43 +0100
+Subject: [PATCH] Enable PCIe BAR1 P2P on consumer Blackwell (RTX 5060 Ti /
+ 5090)
+
+Port of aikitoria's 595.71.05 BAR1 P2P patch to 595.91.07.
+
+Stock consumer drivers expose no working GPU-to-GPU P2P path: the mailbox
+route is fused off and the BAR1 route is stubbed out on non-datacenter
+parts. This routes peer mappings through BAR1 instead, which works on
+consumer Blackwell once the BAR is resizable and large enough.
+
+RM side:
+  - kernel_bif.c: default p2pOverride to reads+writes (0x11) and select
+    NV_REG_STR_RM_PCIEP2P_TYPE_BAR1 instead of the mailbox default.
+  - kern_bus_gp100.c: dispatch _PCIE_BAR1 connection types to the
+    BAR1 P2P create/remove HALs.
+  - g_kern_bus_nvoc.c: point the five kbus*Bar1P2P* vtable slots at the
+    GH100 implementations rather than the 395e98/d69453 stubs, which
+    return "not supported" on consumer SKUs.
+  - io_vaspace.c: drop the left-over-mapping assert in the IOVAS
+    destructor; BAR1 P2P mappings legitimately outlive it.
+  - nv_gpu_ops.c, osmemdesc.c: rewrite peer apertures to SYS_COH so the
+    PTEs describe BAR1 as system-coherent memory.
+
+Kernel side:
+  - nv-reg.h: default NVreg_EnableResizableBar to 1. Without a resized
+    BAR1 there is no window to map the peer through.
+  - os-mlock.c, nv-dma.c, nv.c: carry the hugepage compound order
+    alongside locked user pages, via a hidden header on the page array,
+    so 2 MB compound pages are not walked as 4 KB pages.
+  - uvm_gpu.h: treat GB100+ as coherent so UVM's P2P registration takes
+    the same route as the SYS_COH aperture rewrite above; otherwise the
+    ZONE_DEVICE peer DMA setup conflicts with the BAR1-as-sysmem PTEs.
+
+Requires "Above 4G Decoding" and Resizable BAR enabled in firmware, and
+iommu=pt (see GRUB_CMDLINE_LINUX_DEFAULT).
+
+Tested on 4x RTX 5060 Ti (16 GB), Ubuntu 22.04, kernel 5.15.0-190/-191:
+nvidia-smi topo -p2p rw reports OK for all 12 ordered pairs.
+
+Based on the 595.71.05 patch by aikitoria.
+---
+ kernel-open/common/inc/nv-linux.h             |   2 +
+ kernel-open/common/inc/nv.h                   |   2 +
+ kernel-open/nvidia-uvm/uvm_gpu.h              |   7 +
+ kernel-open/nvidia/nv-dma.c                   | 193 ++++++++++++------
+ kernel-open/nvidia/nv-reg.h                   |   2 +-
+ kernel-open/nvidia/nv.c                       |  38 +++-
+ kernel-open/nvidia/os-mlock.c                 | 132 +++++++++++-
+ src/nvidia/arch/nvalloc/unix/include/nv.h     |   2 +
+ src/nvidia/arch/nvalloc/unix/src/osmemdesc.c  | 109 +++++++---
+ src/nvidia/generated/g_kern_bus_nvoc.c        |  10 +-
+ src/nvidia/src/kernel/gpu/bif/kernel_bif.c    |   6 +-
+ .../gpu/bus/arch/pascal/kern_bus_gp100.c      |  10 +
+ src/nvidia/src/kernel/mem_mgr/io_vaspace.c    |  21 +-
+ src/nvidia/src/kernel/rmapi/nv_gpu_ops.c      |  48 ++++-
+ 14 files changed, 457 insertions(+), 125 deletions(-)
+
+diff --git a/kernel-open/common/inc/nv-linux.h b/kernel-open/common/inc/nv-linux.h
+index f923c04..4de93eb 100644
+--- a/kernel-open/common/inc/nv-linux.h
++++ b/kernel-open/common/inc/nv-linux.h
+@@ -935,6 +935,7 @@ typedef struct nv_alloc_s {
+     unsigned int   cache_type;
+     unsigned int   num_pages;
+     unsigned int   order;
++    unsigned int   compound_order;      /* 0 = normal 4K pages, >0 = hugepage compound order */
+     unsigned int   size;
+     nvidia_pte_t  *page_table;          /* array of physical pages allocated */
+     unsigned int   pid;
+@@ -1066,6 +1067,7 @@ typedef struct nv_dma_map_s {
+     NvU64 page_count;
+     NvBool contiguous;
+     NvU32 cache_type;
++    NvU64 page_granularity;
+     NvBool bReadOnlyDeviceMap;
+     struct sg_table *import_sgt;
+ 
+diff --git a/kernel-open/common/inc/nv.h b/kernel-open/common/inc/nv.h
+index 6a776a5..bbce737 100644
+--- a/kernel-open/common/inc/nv.h
++++ b/kernel-open/common/inc/nv.h
+@@ -963,6 +963,8 @@ NV_STATUS  NV_API_CALL  nv_free_pages            (nv_state_t *, NvU32, NvBool, N
+ 
+ NV_STATUS  NV_API_CALL  nv_register_user_pages   (nv_state_t *, NvU64, NvU64 *, void *, void **, NvBool);
+ void       NV_API_CALL  nv_unregister_user_pages (nv_state_t *, NvU64, void **, void **);
++NvU32      NV_API_CALL  nv_get_compound_order    (void *);
++NvU32      NV_API_CALL  nv_get_page_array_compound_order(void *);
+ 
+ NV_STATUS NV_API_CALL   nv_register_peer_io_mem  (nv_state_t *, NvU64 *, NvU64, void **);
+ void      NV_API_CALL   nv_unregister_peer_io_mem(nv_state_t *, void *);
+diff --git a/kernel-open/nvidia-uvm/uvm_gpu.h b/kernel-open/nvidia-uvm/uvm_gpu.h
+index 45b2ff7..6ec8417 100644
+--- a/kernel-open/nvidia-uvm/uvm_gpu.h
++++ b/kernel-open/nvidia-uvm/uvm_gpu.h
+@@ -1824,6 +1824,13 @@ NvU64 uvm_parent_gpu_canonical_address(uvm_parent_gpu_t *parent_gpu, NvU64 addr)
+ 
+ static bool uvm_parent_gpu_is_coherent(const uvm_parent_gpu_t *parent_gpu)
+ {
++    // Blackwell+ consumer GPUs (e.g. 5090) use BAR1 P2P via the SYS_COH
++    // aperture rewrite in nvGpuOpsBuildExternalAllocPtes. UVM's P2P
++    // registration path must take the coherent route to match, otherwise
++    // the ZONE_DEVICE peer DMA setup conflicts with BAR1-as-sysmem PTEs.
++    if (parent_gpu->rm_info.gpuArch >= NV2080_CTRL_MC_ARCH_INFO_ARCHITECTURE_GB100)
++        return true;
++
+     return parent_gpu->system_bus.memory_window_end > parent_gpu->system_bus.memory_window_start;
+ }
+ 
+diff --git a/kernel-open/nvidia/nv-dma.c b/kernel-open/nvidia/nv-dma.c
+index d9a63c9..f1c257c 100644
+--- a/kernel-open/nvidia/nv-dma.c
++++ b/kernel-open/nvidia/nv-dma.c
+@@ -80,10 +80,11 @@ static NV_STATUS nv_dma_map_contig(
+     NvU64 *va
+ )
+ {
++    NvU64 mapping_size = dma_map->page_count * dma_map->page_granularity;
+     enum dma_data_direction direction = nv_dma_get_direction(dma_map);
+ 
+     *va = dma_map_page_attrs(dma_map->dev, dma_map->pages[0], 0,
+-                             dma_map->page_count * PAGE_SIZE,
++                             mapping_size,
+                              direction,
+                              (dma_map->cache_type == NV_MEMORY_UNCACHED) ?
+                               DMA_ATTR_SKIP_CPU_SYNC : 0);
+@@ -94,12 +95,12 @@ static NV_STATUS nv_dma_map_contig(
+ 
+     dma_map->mapping.contig.dma_addr = *va;
+ 
+-    if (!nv_dma_is_addressable(dma_dev, *va, dma_map->page_count * PAGE_SIZE))
++    if (!nv_dma_is_addressable(dma_dev, *va, mapping_size))
+     {
+         NV_DMA_DEV_PRINTF(NV_DBG_ERRORS, dma_dev,
+                 "DMA address not in addressable range of device "
+                 "(0x%llx-0x%llx, 0x%llx-0x%llx)\n",
+-                *va, *va + (dma_map->page_count * PAGE_SIZE - 1),
++                *va, *va + (mapping_size - 1),
+                 dma_dev->addressable_range.start,
+                 dma_dev->addressable_range.limit);
+         nv_dma_unmap_contig(dma_map);
+@@ -111,10 +112,11 @@ static NV_STATUS nv_dma_map_contig(
+ 
+ static void nv_dma_unmap_contig(nv_dma_map_t *dma_map)
+ {
++    NvU64 mapping_size = dma_map->page_count * dma_map->page_granularity;
+     enum dma_data_direction direction = nv_dma_get_direction(dma_map);
+ 
+     dma_unmap_page_attrs(dma_map->dev, dma_map->mapping.contig.dma_addr,
+-                         dma_map->page_count * PAGE_SIZE,
++                         mapping_size,
+                          direction,
+                          (dma_map->cache_type == NV_MEMORY_UNCACHED) ?
+                           DMA_ATTR_SKIP_CPU_SYNC : 0);
+@@ -147,85 +149,128 @@ static void nv_fill_scatterlist
+ 
+ NV_STATUS nv_create_dma_map_scatterlist(nv_dma_map_t *dma_map)
+ {
+-    /*
+-     * We need to split our mapping into at most 4GB - PAGE_SIZE chunks.
+-     * The Linux kernel stores the length (and offset) of a scatter-gather
+-     * segment as an unsigned int, so it will overflow if we try to do
+-     * anything larger.
+-     */
+     NV_STATUS status;
+     nv_dma_submap_t *submap;
+     NvU32 i;
+-    NvU64 allocated_size = 0;
+-    NvU64 num_submaps = dma_map->page_count + NV_DMA_SUBMAP_MAX_PAGES - 1;
+-    NvU64 total_size = dma_map->page_count << PAGE_SHIFT;
+ 
+     /*
+-     * This turns into 64-bit division, which the ARMv7 kernel doesn't provide
+-     * implicitly. Instead, we need to use the platform's do_div() to perform
+-     * the division.
++     * Hugepage fast path: when page_granularity > PAGE_SIZE, each page array
++     * entry covers one hugepage. Create a single submap with manually
++     * constructed SG entries instead of using sg_alloc_table_from_pages which
++     * operates at PAGE_SIZE granularity.
+      */
+-    do_div(num_submaps, NV_DMA_SUBMAP_MAX_PAGES);
++    if (dma_map->page_granularity > PAGE_SIZE)
++    {
++        int ret;
+ 
+-    WARN_ON(NvU64_HI32(num_submaps) != 0);
++        dma_map->mapping.discontig.submap_count = 1;
+ 
+-    if (dma_map->import_sgt && (num_submaps != 1))
+-    {
+-        return -EINVAL;
+-    }
++        status = os_alloc_mem((void **)&dma_map->mapping.discontig.submaps,
++            sizeof(nv_dma_submap_t));
++        if (status != NV_OK)
++            return status;
+ 
+-    dma_map->mapping.discontig.submap_count = NvU64_LO32(num_submaps);
++        os_mem_set(dma_map->mapping.discontig.submaps, 0, sizeof(nv_dma_submap_t));
+ 
+-    status = os_alloc_mem((void **)&dma_map->mapping.discontig.submaps,
+-        sizeof(nv_dma_submap_t) * dma_map->mapping.discontig.submap_count);
+-    if (status != NV_OK)
+-    {
+-        return status;
+-    }
++        submap = &dma_map->mapping.discontig.submaps[0];
++        submap->page_count = dma_map->page_count;
+ 
+-    os_mem_set((void *)dma_map->mapping.discontig.submaps, 0,
+-        sizeof(nv_dma_submap_t) * dma_map->mapping.discontig.submap_count);
++        ret = sg_alloc_table(&submap->sgt, submap->page_count, NV_GFP_KERNEL);
++        if (ret != 0)
++        {
++            os_free_mem(dma_map->mapping.discontig.submaps);
++            return NV_ERR_OPERATING_SYSTEM;
++        }
+ 
+-    /* If we have an imported SGT, just use that directly. */
+-    if (dma_map->import_sgt)
+-    {
+-        dma_map->mapping.discontig.submaps[0].page_count = dma_map->page_count;
+-        dma_map->mapping.discontig.submaps[0].sgt = *dma_map->import_sgt;
+-        dma_map->mapping.discontig.submaps[0].imported = NV_TRUE;
++        {
++            struct scatterlist *sg;
++            unsigned int j;
+ 
+-        return status;
++            for_each_sg(submap->sgt.sgl, sg, submap->page_count, j)
++                sg_set_page(sg, dma_map->pages[j], dma_map->page_granularity, 0);
++        }
++
++        return NV_OK;
+     }
+ 
+-    NV_FOR_EACH_DMA_SUBMAP(dma_map, submap, i)
++    /*
++     * Normal path: split into at most 4GB - PAGE_SIZE chunks.
++     * The Linux kernel stores the length (and offset) of a scatter-gather
++     * segment as an unsigned int, so it will overflow if we try to do
++     * anything larger.
++     */
+     {
+-        NvU64 submap_size = NV_MIN(NV_DMA_SUBMAP_MAX_PAGES << PAGE_SHIFT,
+-                                   total_size - allocated_size);
++        NvU64 allocated_size = 0;
++        NvU64 num_submaps = dma_map->page_count + NV_DMA_SUBMAP_MAX_PAGES - 1;
++        NvU64 total_size = dma_map->page_count << PAGE_SHIFT;
+ 
+-        submap->page_count = (NvU32)(submap_size >> PAGE_SHIFT);
++        /*
++         * This turns into 64-bit division, which the ARMv7 kernel doesn't provide
++         * implicitly. Instead, we need to use the platform's do_div() to perform
++         * the division.
++         */
++        do_div(num_submaps, NV_DMA_SUBMAP_MAX_PAGES);
++
++        WARN_ON(NvU64_HI32(num_submaps) != 0);
+ 
+-        status = NV_ALLOC_DMA_SUBMAP_SCATTERLIST(dma_map, submap, i);
++        if (dma_map->import_sgt && (num_submaps != 1))
++        {
++            return -EINVAL;
++        }
++
++        dma_map->mapping.discontig.submap_count = NvU64_LO32(num_submaps);
++
++        status = os_alloc_mem((void **)&dma_map->mapping.discontig.submaps,
++            sizeof(nv_dma_submap_t) * dma_map->mapping.discontig.submap_count);
+         if (status != NV_OK)
+         {
+-            submap->page_count = 0;
+-            break;
++            return status;
+         }
+ 
+-#if defined(NV_DOM0_KERNEL_PRESENT)
++        os_mem_set((void *)dma_map->mapping.discontig.submaps, 0,
++            sizeof(nv_dma_submap_t) * dma_map->mapping.discontig.submap_count);
++
++        /* If we have an imported SGT, just use that directly. */
++        if (dma_map->import_sgt)
+         {
+-            NvU64 page_idx = NV_DMA_SUBMAP_IDX_TO_PAGE_IDX(i);
+-            nv_fill_scatterlist(submap->sgt.sgl,
+-                &dma_map->pages[page_idx], submap->page_count);
++            dma_map->mapping.discontig.submaps[0].page_count = dma_map->page_count;
++            dma_map->mapping.discontig.submaps[0].sgt = *dma_map->import_sgt;
++            dma_map->mapping.discontig.submaps[0].imported = NV_TRUE;
++
++            return status;
+         }
++
++        NV_FOR_EACH_DMA_SUBMAP(dma_map, submap, i)
++        {
++            NvU64 submap_size = NV_MIN(NV_DMA_SUBMAP_MAX_PAGES << PAGE_SHIFT,
++                                       total_size - allocated_size);
++
++            submap->page_count = (NvU32)(submap_size >> PAGE_SHIFT);
++
++            status = NV_ALLOC_DMA_SUBMAP_SCATTERLIST(dma_map, submap, i);
++            if (status != NV_OK)
++            {
++                submap->page_count = 0;
++                break;
++            }
++
++#if defined(NV_DOM0_KERNEL_PRESENT)
++            {
++                NvU64 page_idx = NV_DMA_SUBMAP_IDX_TO_PAGE_IDX(i);
++                nv_fill_scatterlist(submap->sgt.sgl,
++                    &dma_map->pages[page_idx], submap->page_count);
++            }
+ #endif
+ 
+-        allocated_size += submap_size;
+-    }
++            allocated_size += submap_size;
++        }
+ 
+-    WARN_ON(allocated_size != total_size);
++        WARN_ON(allocated_size != total_size);
+ 
+-    if (status != NV_OK)
+-    {
+-        nv_destroy_dma_map_scatterlist(dma_map);
++        if (status != NV_OK)
++        {
++            nv_destroy_dma_map_scatterlist(dma_map);
++        }
+     }
+ 
+     return status;
+@@ -313,12 +358,29 @@ static void nv_load_dma_map_scatterlist(
+     unsigned int i, j;
+     struct scatterlist *sg;
+     nv_dma_submap_t *submap;
+-    NvU64 sg_addr, sg_off, sg_len, k, l = 0;
++    NvU64 l = 0;
++
++    /*
++     * Hugepage fast path: one va_array entry per SG entry (one per hugepage).
++     * No need to split SG entries into PAGE_SIZE chunks.
++     */
++    if (dma_map->page_granularity > PAGE_SIZE)
++    {
++        NV_FOR_EACH_DMA_SUBMAP(dma_map, submap, i)
++        {
++            for_each_sg(submap->sgt.sgl, sg, submap->sg_map_count, j)
++                va_array[l++] = sg_dma_address(sg);
++        }
++        return;
++    }
+ 
++    /* Normal path */
+     NV_FOR_EACH_DMA_SUBMAP(dma_map, submap, i)
+     {
+         for_each_sg(submap->sgt.sgl, sg, submap->sg_map_count, j)
+         {
++            NvU64 sg_addr, sg_off, sg_len, k;
++
+             /*
+              * It is possible for pci_map_sg() to merge scatterlist entries, so
+              * make sure we account for that here.
+@@ -364,7 +426,7 @@ static NV_STATUS nv_dma_map_scatterlist(
+ 
+     for (i = 0; i < dma_map->page_count; i++)
+     {
+-        if (!nv_dma_is_addressable(dma_dev, va_array[i], PAGE_SIZE))
++        if (!nv_dma_is_addressable(dma_dev, va_array[i], dma_map->page_granularity))
+         {
+             NV_DMA_DEV_PRINTF(NV_DBG_ERRORS, dma_dev,
+                     "DMA address not in addressable range of device "
+@@ -423,6 +485,7 @@ NV_STATUS NV_API_CALL nv_dma_map_sgt(
+     dma_map->page_count = page_count;
+     dma_map->contiguous = NV_FALSE;
+     dma_map->cache_type = cache_type;
++    dma_map->page_granularity = PAGE_SIZE;
+     dma_map->bReadOnlyDeviceMap = bReadOnlyDeviceMap;
+ 
+     dma_map->mapping.discontig.submap_count = 0;
+@@ -470,6 +533,7 @@ static NV_STATUS NV_API_CALL nv_dma_map_pages(
+     NvBool           contig,
+     NvU32            cache_type,
+     NvBool           bReadOnlyDeviceMap,
++    NvU64            page_granularity,
+     void           **priv
+ )
+ {
+@@ -506,6 +570,7 @@ static NV_STATUS NV_API_CALL nv_dma_map_pages(
+     dma_map->page_count = page_count;
+     dma_map->contiguous = contig;
+     dma_map->cache_type = cache_type;
++    dma_map->page_granularity = page_granularity;
+     dma_map->bReadOnlyDeviceMap = bReadOnlyDeviceMap;
+ 
+     if (dma_map->page_count > 1 && !dma_map->contiguous)
+@@ -671,8 +736,16 @@ NV_STATUS NV_API_CALL nv_dma_map_alloc
+     }
+ 
+     *priv = pages;
+-    status = nv_dma_map_pages(dma_dev, page_count, va_array, contig, cache_type,
+-                              bReadOnlyDeviceMap, priv);
++    {
++        NvU64 page_granularity = PAGE_SIZE;
++
++        if (at != NULL && at->compound_order > 0)
++            page_granularity = (NvU64)PAGE_SIZE << at->compound_order;
++
++        status = nv_dma_map_pages(dma_dev, page_count, va_array, contig,
++                                  cache_type, bReadOnlyDeviceMap,
++                                  page_granularity, priv);
++    }
+     if (status != NV_OK)
+     {
+         *priv = at;
+@@ -898,7 +971,7 @@ void NV_API_CALL nv_dma_cache_invalidate
+     {
+         dma_sync_single_for_device(dma_dev->dev,
+                                    dma_map->mapping.contig.dma_addr,
+-                                   (size_t) PAGE_SIZE * dma_map->page_count,
++                                   (size_t) dma_map->page_granularity * dma_map->page_count,
+                                    DMA_FROM_DEVICE);
+     }
+     else
+diff --git a/kernel-open/nvidia/nv-reg.h b/kernel-open/nvidia/nv-reg.h
+index 88a4536..3a209b4 100644
+--- a/kernel-open/nvidia/nv-reg.h
++++ b/kernel-open/nvidia/nv-reg.h
+@@ -1046,7 +1046,7 @@ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_NVLINK_DISABLE, 0);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_PCIE_RELAXED_ORDERING_MODE, 0);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_REGISTER_PCI_DRIVER, 1);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_REGISTER_PLATFORM_DEVICE_DRIVER, 1);
+-NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_RESIZABLE_BAR, 0);
++NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_RESIZABLE_BAR, 1);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_DBG_BREAKPOINT, 0);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_TEGRA_GPU_PG_MASK, ~0);
+ NV_DEFINE_REG_ENTRY_GLOBAL(__NV_ENABLE_NONBLOCKING_OPEN, 1);
+diff --git a/kernel-open/nvidia/nv.c b/kernel-open/nvidia/nv.c
+index 1bea50a..4ebc6a6 100644
+--- a/kernel-open/nvidia/nv.c
++++ b/kernel-open/nvidia/nv.c
+@@ -3474,12 +3474,22 @@ NV_STATUS NV_API_CALL nv_register_user_pages(
+     NvU64 i;
+     struct page **user_pages;
+     nv_linux_state_t *nvl;
++    NvU32 compound_order;
++    NvU64 effective_count;
+ 
+     nv_printf(NV_DBG_MEMINFO, "NVRM: VM: nv_register_user_pages: 0x%" NvU64_fmtx"\n", page_count);
+     user_pages = *priv_data;
+     nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+ 
+-    at = nvos_create_alloc(nvl->dev, page_count);
++    /* Read compound_order from os_lock_user_pages() hidden header. */
++    compound_order = nv_get_page_array_compound_order(user_pages);
++
++    if (compound_order > 0)
++        effective_count = page_count >> compound_order;
++    else
++        effective_count = page_count;
++
++    at = nvos_create_alloc(nvl->dev, effective_count);
+ 
+     if (at == NULL)
+     {
+@@ -3500,9 +3510,10 @@ NV_STATUS NV_API_CALL nv_register_user_pages(
+     if (unencrypted)
+         at->flags.unencrypted = NV_TRUE;
+ 
++    at->compound_order = compound_order;
+     at->order = get_order(at->num_pages * PAGE_SIZE);
+ 
+-    for (i = 0; i < page_count; i++)
++    for (i = 0; i < effective_count; i++)
+     {
+         /*
+          * We only assign the physical address and not the DMA address, since
+@@ -3527,6 +3538,29 @@ NV_STATUS NV_API_CALL nv_register_user_pages(
+     return NV_OK;
+ }
+ 
++NvU32 NV_API_CALL nv_get_compound_order(
++    void *priv_data
++)
++{
++    nv_alloc_t *at = priv_data;
++    return at->compound_order;
++}
++
++/*
++ * Read compound_order from the hidden header prepended to a page array
++ * by os_lock_user_pages().
++ *
++ * Layout: [num_entries:NvU64][compound_order:NvU64][struct page * array...]
++ *                                                   ^ page_array points here
++ */
++NvU32 NV_API_CALL nv_get_page_array_compound_order(
++    void *page_array
++)
++{
++    NvU64 *header = (NvU64 *)((NvU8 *)page_array - 2 * sizeof(NvU64));
++    return (NvU32)header[1];
++}
++
+ void NV_API_CALL nv_unregister_user_pages(
+     nv_state_t *nv,
+     NvU64       page_count,
+diff --git a/kernel-open/nvidia/os-mlock.c b/kernel-open/nvidia/os-mlock.c
+index e32b9b7..994c326 100644
+--- a/kernel-open/nvidia/os-mlock.c
++++ b/kernel-open/nvidia/os-mlock.c
+@@ -25,6 +25,7 @@
+ 
+ #include "os-interface.h"
+ #include "nv-linux.h"
++#include <linux/hugetlb.h>
+ 
+ #if defined(NVCPU_FAMILY_X86) && defined(NV_FOLL_LONGTERM_PRESENT) && \
+     (defined(NV_PIN_USER_PAGES_HAS_ARGS_VMAS) ||                      \
+@@ -213,6 +214,56 @@ done:
+     return rmStatus;
+ }
+ 
++/*
++ * Hidden header prepended to every page array returned by os_lock_user_pages().
++ * Stores metadata that travels with the page array through opaque void* layers.
++ *
++ * Memory layout: [nv_page_array_header_t][struct page * array[num_entries]]
++ *
++ * The caller receives a pointer to the struct page * array (past the header).
++ * nv_register_user_pages() and os_unlock_user_pages() read the header at a
++ * negative offset to recover num_entries and compound_order.
++ */
++typedef struct {
++    NvU64 num_entries;
++    NvU64 compound_order;
++} nv_page_array_header_t;
++
++#define NV_PAGE_ARRAY_HEADER_SIZE sizeof(nv_page_array_header_t)
++
++static inline nv_page_array_header_t *nv_page_array_header(struct page **pages)
++{
++    return (nv_page_array_header_t *)((NvU8 *)pages - NV_PAGE_ARRAY_HEADER_SIZE);
++}
++
++static NV_STATUS nv_alloc_page_array(
++    NvU64 num_entries,
++    NvU32 compound_order,
++    struct page ***out_pages
++)
++{
++    NV_STATUS status;
++    NvU8 *raw;
++    nv_page_array_header_t *header;
++
++    status = os_alloc_mem((void **)&raw,
++            NV_PAGE_ARRAY_HEADER_SIZE + num_entries * sizeof(struct page *));
++    if (status != NV_OK)
++        return status;
++
++    header = (nv_page_array_header_t *)raw;
++    header->num_entries = num_entries;
++    header->compound_order = compound_order;
++
++    *out_pages = (struct page **)(raw + NV_PAGE_ARRAY_HEADER_SIZE);
++    return NV_OK;
++}
++
++static void nv_free_page_array(struct page **pages)
++{
++    os_free_mem((NvU8 *)pages - NV_PAGE_ARRAY_HEADER_SIZE);
++}
++
+ NV_STATUS NV_API_CALL os_lock_user_pages(
+     void   *address,
+     NvU64   page_count,
+@@ -223,8 +274,7 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+     NV_STATUS rmStatus;
+     struct mm_struct *mm = current->mm;
+     struct page **user_pages;
+-    NvU64 i;
+-    NvU64 npages = page_count;
++    NvU64 i, j;
+     NvU64 pinned = 0;
+     unsigned int gup_flags = DRF_VAL(_LOCK_USER_PAGES, _FLAGS, _WRITE, flags) ? FOLL_WRITE : 0;
+     long ret;
+@@ -240,18 +290,75 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+         return NV_ERR_NOT_SUPPORTED;
+     }
+ 
+-    rmStatus = os_alloc_mem((void **)&user_pages,
+-            (page_count * sizeof(*user_pages)));
++    nv_mmap_read_lock(mm);
++
++    /*
++     * Hugetlb fast path: detect hugetlb VMAs and pin one page per hugepage.
++     * Pinning any sub-page of a compound page pins the entire folio via its
++     * refcount, so we only need one pin per hugepage. This reduces the page
++     * array from millions of entries to tens of entries for large mappings.
++     *
++     * Pages must be faulted before this call (caller should first-touch the
++     * entire mapping). pin_user_pages can fault on demand but is slow for
++     * unfaulted 1GB hugepages (~37ms per fault).
++     */
++    {
++        struct vm_area_struct *vma = vma_lookup(mm, (unsigned long)address);
++
++        if (vma && is_vm_hugetlb_page(vma))
++        {
++            unsigned long hpage_size = vma_kernel_pagesize(vma);
++            unsigned int order = ilog2(hpage_size / PAGE_SIZE);
++            NvU64 pages_per_hp = 1ULL << order;
++
++            if ((page_count & (pages_per_hp - 1)) == 0)
++            {
++                NvU64 num_hugepages = page_count >> order;
++
++                rmStatus = nv_alloc_page_array(num_hugepages, order, &user_pages);
++                if (rmStatus != NV_OK)
++                {
++                    nv_mmap_read_unlock(mm);
++                    nv_printf(NV_DBG_ERRORS,
++                            "NVRM: failed to allocate hugepage table!\n");
++                    return rmStatus;
++                }
++
++                for (i = 0; i < num_hugepages; i++)
++                {
++                    ret = NV_PIN_USER_PAGES(
++                        (unsigned long)address + i * hpage_size,
++                        1, gup_flags, &user_pages[i]);
++                    if (ret != 1)
++                    {
++                        for (j = 0; j < i; j++)
++                            NV_UNPIN_USER_PAGE(user_pages[j]);
++                        nv_free_page_array(user_pages);
++                        nv_mmap_read_unlock(mm);
++                        return NV_ERR_INVALID_ADDRESS;
++                    }
++                }
++
++                nv_mmap_read_unlock(mm);
++
++                *page_array = user_pages;
++                return NV_OK;
++            }
++        }
++    }
++
++    /* Normal path: pin all pages at 4K granularity */
++    rmStatus = nv_alloc_page_array(page_count, 0, &user_pages);
+     if (rmStatus != NV_OK)
+     {
++        nv_mmap_read_unlock(mm);
+         nv_printf(NV_DBG_ERRORS,
+                 "NVRM: failed to allocate page table!\n");
+         return rmStatus;
+     }
+ 
+-    nv_mmap_read_lock(mm);
+     ret = NV_PIN_USER_PAGES((unsigned long)address,
+-                            npages, gup_flags, user_pages);
++                            page_count, gup_flags, user_pages);
+     if (ret > 0)
+     {
+         pinned = ret;
+@@ -276,6 +383,8 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+     else if ((ret == -ENOMEM) &&
+              (page_count > NV_NUM_PIN_PAGES_PER_ITERATION))
+     {
++        NvU64 npages;
++
+         for (pinned = 0; pinned < page_count; pinned += ret)
+         {
+             npages = page_count - pinned;
+@@ -299,7 +408,7 @@ NV_STATUS NV_API_CALL os_lock_user_pages(
+     {
+         for (i = 0; i < pinned; i++)
+             NV_UNPIN_USER_PAGE(user_pages[i]);
+-        os_free_mem(user_pages);
++        nv_free_page_array(user_pages);
+         return NV_ERR_INVALID_ADDRESS;
+     }
+ 
+@@ -316,16 +425,19 @@ NV_STATUS NV_API_CALL os_unlock_user_pages(
+ {
+     NvBool write = FLD_TEST_DRF(_LOCK_USER_PAGES, _FLAGS, _WRITE, _YES, flags);
+     struct page **user_pages = page_array;
+-    NvU32 i;
++    nv_page_array_header_t *header = nv_page_array_header(user_pages);
++    NvU64 num_entries = header->num_entries;
++    NvU64 i;
+ 
+-    for (i = 0; i < page_count; i++)
++    for (i = 0; i < num_entries; i++)
+     {
+         if (write)
+             set_page_dirty_lock(user_pages[i]);
++
+         NV_UNPIN_USER_PAGE(user_pages[i]);
+     }
+ 
+-    os_free_mem(user_pages);
++    nv_free_page_array(user_pages);
+ 
+     return NV_OK;
+ }
+diff --git a/src/nvidia/arch/nvalloc/unix/include/nv.h b/src/nvidia/arch/nvalloc/unix/include/nv.h
+index 8ca7fa5..453416e 100644
+--- a/src/nvidia/arch/nvalloc/unix/include/nv.h
++++ b/src/nvidia/arch/nvalloc/unix/include/nv.h
+@@ -963,6 +963,8 @@ NV_STATUS  NV_API_CALL  nv_free_pages            (nv_state_t *, NvU32, NvBool, N
+ 
+ NV_STATUS  NV_API_CALL  nv_register_user_pages   (nv_state_t *, NvU64, NvU64 *, void *, void **, NvBool);
+ void       NV_API_CALL  nv_unregister_user_pages (nv_state_t *, NvU64, void **, void **);
++NvU32      NV_API_CALL  nv_get_compound_order    (void *);
++NvU32      NV_API_CALL  nv_get_page_array_compound_order(void *);
+ 
+ NV_STATUS NV_API_CALL   nv_register_peer_io_mem  (nv_state_t *, NvU64 *, NvU64, void **);
+ void      NV_API_CALL   nv_unregister_peer_io_mem(nv_state_t *, void *);
+diff --git a/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c b/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
+index 17328f2..b31597e 100644
+--- a/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
++++ b/src/nvidia/arch/nvalloc/unix/src/osmemdesc.c
+@@ -190,6 +190,8 @@ osCreateMemdescFromPages
+     NvU32 gpuCachedFlags;
+     NvBool bUnprotected = NV_FALSE;
+     NvU64 osPageCount;
++    NvU32 compoundOrder;
++    NvU64 memdescSize;
+ 
+     //
+     // Align size up to os page size. This is important in
+@@ -201,6 +203,24 @@ osCreateMemdescFromPages
+ 
+     osPageCount = size >> os_page_shift;
+ 
++    //
++    // Read compound_order from os_lock_user_pages() hidden header. For
++    // hugepages, pass a reduced size to memdescCreate so the PTE array is
++    // sized for hugepage count instead of 4K page count. Restored after.
++    //
++    compoundOrder = nv_get_page_array_compound_order(*ppPrivate);
++
++    if (compoundOrder > 0)
++    {
++        NvU64 hugepageCount = size >> (os_page_shift + compoundOrder);
++
++        memdescSize = hugepageCount * NV_RM_PAGE_SIZE;
++    }
++    else
++    {
++        memdescSize = size;
++    }
++
+     if (FLD_TEST_DRF(OS02, _FLAGS, _ALLOC_NISO_DISPLAY, _YES, flags))
+     {
+         memdescFlags |= MEMDESC_FLAGS_MEMORY_TYPE_DISPLAY_NISO;
+@@ -223,7 +243,7 @@ osCreateMemdescFromPages
+         memdescFlags |= MEMDESC_FLAGS_DEVICE_READ_ONLY;
+     }
+ 
+-    rmStatus = memdescCreate(ppMemDesc, pGpu, size, 0,
++    rmStatus = memdescCreate(ppMemDesc, pGpu, memdescSize, 0,
+                              NV_MEMORY_NONCONTIGUOUS, ADDR_SYSMEM,
+                              cacheType, memdescFlags);
+     if (rmStatus != NV_OK)
+@@ -231,12 +251,19 @@ osCreateMemdescFromPages
+         return rmStatus;
+     }
+ 
++    pMemDesc = *ppMemDesc;
++
++    // Restore actual size (memdescCreate stored the reduced PTE-sizing value).
++    if (compoundOrder > 0)
++    {
++        pMemDesc->Size = size;
++    }
++
+     if (FLD_TEST_DRF(OS02, _FLAGS, _GPU_CACHEABLE, _YES, flags))
+         gpuCachedFlags = NV_MEMORY_CACHED;
+     else
+         gpuCachedFlags = NV_MEMORY_UNCACHED;
+ 
+-    pMemDesc = *ppMemDesc;
+     rmStatus = nv_register_user_pages(NV_GET_NV_STATE(pGpu),
+             osPageCount,
+             memdescGetPteArray(pMemDesc, AT_CPU), pImportPriv,
+@@ -251,7 +278,25 @@ osCreateMemdescFromPages
+     memdescSetFlag(pMemDesc, MEMDESC_FLAGS_KERNEL_MODE, NV_FALSE);
+     memdescSetFlag(pMemDesc, MEMDESC_FLAGS_EXT_PAGE_ARRAY_MEM, NV_TRUE);
+ 
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++    //
++    // For hugepages, set pageArrayGranularity to the hugepage size and
++    // advertise it as the GPU page size so UVM can use large GPU PTEs
++    // (e.g. 512MB on Blackwell) instead of 2MB.
++    //
++    if (compoundOrder > 0)
++    {
++        NvU64 hugepageGranularity = (NvU64)os_page_size << compoundOrder;
++
++        NV_ASSERT_OK_OR_GOTO(rmStatus,
++            memdescSetAllocSizeFields(pMemDesc, size, (NvU32)hugepageGranularity),
++            cleanup);
++
++        // TODO: UVM clamps to largest supported GPU page size via alignment.
++        // nvGpuOpsBuildExternalAllocPtes allows mappingPageSize <= pageSize
++        // when pageSize % mappingPageSize == 0.
++        memdescSetPageSize(pMemDesc, AT_GPU, hugepageGranularity);
++    }
++    else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+     {
+         NV_ASSERT_OR_GOTO((os_page_size & (pMemDesc->pageArrayGranularity - 1ULL)) == 0, cleanup);
+         NV_ASSERT_OK_OR_GOTO(rmStatus, memdescSetAllocSizeFields(pMemDesc, size, os_page_size), cleanup);
+@@ -269,10 +314,14 @@ osCreateMemdescFromPages
+ 
+ 
+     //
+-    // If the OS layer doesn't think in RM page size, we need to inflate the
+-    // PTE array into RM pages.
++    // Inflate PTE array to RM pages.
++    // Skip for hugepages (already at granularity) and dynamic granularity.
+     //
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++    if (compoundOrder > 0)
++    {
++        // Hugepages: already at granularity, no conversion needed.
++    }
++    else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+     {
+         // Because os_page_size == pMemDesc->pageArrayGranularity, we don't need to do any page array conversion.
+         NV_ASSERT_OR_ELSE(os_page_size == pMemDesc->pageArrayGranularity, rmStatus = NV_ERR_INVALID_ARGUMENT; goto cleanup);
+@@ -294,10 +343,15 @@ osCreateMemdescFromPages
+     memdescSetMemData(pMemDesc, *ppPrivate, NULL);
+ 
+     rmStatus = memdescMapIommu(pMemDesc, pGpu->busInfo.iovaspaceId);
++
+ cleanup:
+     if (rmStatus != NV_OK)
+     {
+-        if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++        if (compoundOrder > 0)
++        {
++            // Hugepages: no deflation needed.
++        }
++        else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+         {
+             // Because os_page_size == pMemDesc->pageArrayGranularity, we don't need to do any page array conversion.
+             NV_ASSERT(os_page_size == pMemDesc->pageArrayGranularity);
+@@ -1187,15 +1241,24 @@ osDestroyOsDescriptorPageArray
+     MEMORY_DESCRIPTOR *pMemDesc
+ )
+ {
+-    OBJGPU   *pGpu        = pMemDesc->pGpu;
+-    NvU64     osPageCount;
++    OBJGPU   *pGpu = pMemDesc->pGpu;
+     NV_STATUS status;
+     void     *pPrivate;
++    NvU32     compoundOrder;
++    NvU64     osPageCount;
+ 
+     pPrivate = memdescGetMemData(pMemDesc);
+ 
+     NV_ASSERT(pPrivate != NULL);
+ 
++    // Read before nv_unregister_user_pages frees the nv_alloc_t.
++    compoundOrder = nv_get_compound_order(pPrivate);
++
++    if (compoundOrder > 0)
++        osPageCount = pMemDesc->PageCount;
++    else
++        osPageCount = NV_RM_PAGES_TO_OS_PAGES(pMemDesc->PageCount);
++
+     //
+     // TODO: Bug 1811006: Notably skip any IOMMU mapping management as the
+     // pMemDesc->pGpu might have been torn down already and the pGpu passed in
+@@ -1205,21 +1268,21 @@ osDestroyOsDescriptorPageArray
+     // be cleaned up once the fix for bug 1811006 is known.
+     //
+ 
+-    if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
++    // Deflate PTE array (skip for hugepages and dynamic granularity).
++    if (compoundOrder > 0)
++    {
++        // Hugepages: already at granularity, no deflation needed.
++    }
++    else if (IS_DISCONTIG_AND_DYNGRAN_ENABLED(pMemDesc))
+     {
+         // Because os_page_size == pMemDesc->pageArrayGranularity, we don't need to do any page array conversion.
+         NV_ASSERT_OR_RETURN_VOID(os_page_size == pMemDesc->pageArrayGranularity);
+-        osPageCount = pMemDesc->PageCount;
+     }
+-    else
+-    {
+-        osPageCount = NV_RM_PAGES_TO_OS_PAGES(pMemDesc->PageCount);
+-        if ((NV_RM_PAGE_SIZE < os_page_size) &&
++    else if ((NV_RM_PAGE_SIZE < os_page_size) &&
+             !memdescGetContiguity(pMemDesc, AT_CPU))
+-        {
+-            RmDeflateRmToOsPageArray(memdescGetPteArray(pMemDesc, AT_CPU),
+-                                    pMemDesc->PageCount);
+-        }
++    {
++        RmDeflateRmToOsPageArray(memdescGetPteArray(pMemDesc, AT_CPU),
++                                pMemDesc->PageCount);
+     }
+ 
+     nv_unregister_user_pages(NV_GET_NV_STATE(pGpu), osPageCount,
+@@ -1231,12 +1294,8 @@ osDestroyOsDescriptorPageArray
+     }
+     else
+     {
+-        //
+-        // We use MEMDESC_FLAGS_USER_READ_ONLY because this reflects the
+-        // NVOS02_FLAGS_ALLOC_USER_READ_ONLY flag value passed into
+-        // os_lock_user_pages(). That flag also results in
+-        // MEMDESC_FLAGS_DEVICE_READ_ONLY being set.
+-        //
++        // TODO: os_unlock_user_pages reads the actual entry count from the
++        // hidden header, so osPageCount is only used in the non-hugepage path.
+         NvBool writable = !memdescGetFlag(pMemDesc, MEMDESC_FLAGS_USER_READ_ONLY);
+         NvU32 flags = DRF_NUM(_LOCK_USER_PAGES, _FLAGS, _WRITE, writable);
+         status = os_unlock_user_pages(osPageCount, pPrivate, flags);
+diff --git a/src/nvidia/generated/g_kern_bus_nvoc.c b/src/nvidia/generated/g_kern_bus_nvoc.c
+index ea7dcba..b76886f 100644
+--- a/src/nvidia/generated/g_kern_bus_nvoc.c
++++ b/src/nvidia/generated/g_kern_bus_nvoc.c
+@@ -1064,7 +1064,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusGetBar1P2PDmaInfo__ = &kbusGetBar1P2PDmaInfo_395e98;
++        pThis->__kbusGetBar1P2PDmaInfo__ = &kbusGetBar1P2PDmaInfo_GH100;
+     }
+ 
+     // kbusIncreaseStaticBar1Refcount -- halified (2 hals) body
+@@ -1112,7 +1112,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusCreateP2PMappingForBar1P2P__ = &kbusCreateP2PMappingForBar1P2P_395e98;
++        pThis->__kbusCreateP2PMappingForBar1P2P__ = &kbusCreateP2PMappingForBar1P2P_GH100;
+     }
+ 
+     // kbusRemoveP2PMappingForBar1P2P -- halified (2 hals) body
+@@ -1124,7 +1124,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusRemoveP2PMappingForBar1P2P__ = &kbusRemoveP2PMappingForBar1P2P_395e98;
++        pThis->__kbusRemoveP2PMappingForBar1P2P__ = &kbusRemoveP2PMappingForBar1P2P_GH100;
+     }
+ 
+     // kbusHasPcieBar1P2PMapping -- halified (2 hals) body
+@@ -1136,7 +1136,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusHasPcieBar1P2PMapping__ = &kbusHasPcieBar1P2PMapping_d69453;
++        pThis->__kbusHasPcieBar1P2PMapping__ = &kbusHasPcieBar1P2PMapping_GH100;
+     }
+ 
+     // kbusIsPcieBar1P2PMappingSupported -- halified (2 hals) body
+@@ -1148,7 +1148,7 @@ static void __nvoc_init_funcTable_KernelBus_1(KernelBus *pThis, GpuHalspecOwner
+     // default
+     else
+     {
+-        pThis->__kbusIsPcieBar1P2PMappingSupported__ = &kbusIsPcieBar1P2PMappingSupported_d69453;
++        pThis->__kbusIsPcieBar1P2PMappingSupported__ = &kbusIsPcieBar1P2PMappingSupported_GH100;
+     }
+ 
+     // kbusCheckFlaSupportedAndInit -- halified (2 hals) body
+diff --git a/src/nvidia/src/kernel/gpu/bif/kernel_bif.c b/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
+index 1dfd8c9..871d171 100644
+--- a/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
++++ b/src/nvidia/src/kernel/gpu/bif/kernel_bif.c
+@@ -1161,8 +1161,8 @@ _kbifInitRegistryOverrides
+ {
+     NvU32 data32;
+ 
+-    // P2P Override
+-    pKernelBif->p2pOverride = BIF_P2P_NOT_OVERRIDEN;
++    // P2P Override: default to both reads+writes enabled so BAR1 P2P works out of the box
++    pKernelBif->p2pOverride = 0x11;
+     if (osReadRegistryDword(pGpu, NV_REG_STR_CL_FORCE_P2P, &data32) == NV_OK)
+     {
+         pKernelBif->p2pOverride = data32;
+@@ -1178,7 +1178,7 @@ _kbifInitRegistryOverrides
+         pKernelBif->forceP2PType = data32;
+     }
+ 
+-    pKernelBif->pcieP2PType = NV_REG_STR_RM_PCIEP2P_TYPE_DEFAULT;
++    pKernelBif->pcieP2PType = NV_REG_STR_RM_PCIEP2P_TYPE_BAR1;
+     if (osReadRegistryDword(pGpu, NV_REG_STR_RM_PCIEP2P_TYPE, &data32) == NV_OK)
+     {
+         pKernelBif->pcieP2PType = data32;
+diff --git a/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c b/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
+index 8f9f830..900f033 100644
+--- a/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
++++ b/src/nvidia/src/kernel/gpu/bus/arch/pascal/kern_bus_gp100.c
+@@ -65,6 +65,11 @@ kbusCreateP2PMapping_GP100
+         return kbusCreateP2PMappingForNvlink_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+     }
+ 
++    if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE_BAR1, attributes))
++    {
++        return kbusCreateP2PMappingForBar1P2P_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, attributes);
++    }
++
+     if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE, attributes))
+     {
+         return kbusCreateP2PMappingForMailbox_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+@@ -643,6 +648,11 @@ kbusRemoveP2PMapping_GP100
+         return kbusRemoveP2PMappingForNvlink_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+     }
+ 
++    if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE_BAR1, attributes))
++    {
++        return kbusRemoveP2PMappingForBar1P2P_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, attributes);
++    }
++
+     if (FLD_TEST_DRF(_P2PAPI, _ATTRIBUTES, _CONNECTION_TYPE, _PCIE, attributes))
+     {
+         return kbusRemoveP2PMappingForMailbox_HAL(pGpu0, pKernelBus0, pGpu1, pKernelBus1, peer0, peer1, attributes);
+diff --git a/src/nvidia/src/kernel/mem_mgr/io_vaspace.c b/src/nvidia/src/kernel/mem_mgr/io_vaspace.c
+index 763969e..cd6cd60 100644
+--- a/src/nvidia/src/kernel/mem_mgr/io_vaspace.c
++++ b/src/nvidia/src/kernel/mem_mgr/io_vaspace.c
+@@ -59,14 +59,15 @@ iovaspaceConstruct__IMPL
+ void
+ iovaspaceDestruct_IMPL(OBJIOVASPACE *pIOVAS)
+ {
+-    OBJVASPACE *pVAS = staticCast(pIOVAS, OBJVASPACE);
+-
+-    if (pIOVAS->mappingCount != 0)
+-    {
+-        NV_PRINTF(LEVEL_ERROR, "%lld left-over mappings in IOVAS 0x%x\n",
+-                  pIOVAS->mappingCount, pVAS->vaspaceId);
+-        DBG_BREAKPOINT();
+-    }
++    // OBJVASPACE *pVAS = staticCast(pIOVAS, OBJVASPACE);
++
++    // TODO: might keep p2p mappings...
++    // if (pIOVAS->mappingCount != 0)
++    // {
++    //     NV_PRINTF(LEVEL_ERROR, "%lld left-over mappings in IOVAS 0x%x\n",
++    //               pIOVAS->mappingCount, pVAS->vaspaceId);
++    //     DBG_BREAKPOINT();
++    // }
+ }
+ 
+ NV_STATUS
+@@ -595,7 +596,7 @@ OBJIOVASPACE *iovaspaceFromMapping(PIOVAMAPPING pIovaMapping)
+     // not, the mapping has been left dangling outlasting the IOVAS it was
+     // under.
+     //
+-    NV_ASSERT(pIOVAS != NULL);
++    // NV_ASSERT(pIOVAS != NULL);
+ 
+     return pIOVAS;
+ }
+@@ -604,7 +605,7 @@ void iovaMappingDestroy(PIOVAMAPPING pIovaMapping)
+ {
+     OBJIOVASPACE *pIOVAS = iovaspaceFromMapping(pIovaMapping);
+ 
+-    NV_ASSERT_OR_RETURN_VOID(pIOVAS != NULL);
++    if (pIOVAS == NULL) return;
+     iovaspaceDestroyMapping(pIOVAS, pIovaMapping);
+ }
+ 
+diff --git a/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c b/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
+index 5a34759..32026b9 100644
+--- a/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
++++ b/src/nvidia/src/kernel/rmapi/nv_gpu_ops.c
+@@ -3875,7 +3875,8 @@ nvGpuOpsBuildExternalAllocPtes
+     NvBool      isPeerSupported,
+     NvBool      isBar1P2PSupported,
+     NvU32       peerId,
+-    gpuExternalMappingInfo *pGpuExternalMappingInfo
++    gpuExternalMappingInfo *pGpuExternalMappingInfo,
++    RmPhysAddr bar1BusAddr
+ )
+ {
+     NV_STATUS               status              = NV_OK;
+@@ -4033,7 +4034,14 @@ nvGpuOpsBuildExternalAllocPtes
+         NvU32 ptePcfHw  = 0;
+ 
+          nvFieldSetBool(&pPteFmt->fldValid, NV_TRUE, pte.v8);
+-         gmmuFieldSetAperture(&pPteFmt->fldAperture, aperture, pte.v8);
++         if ((aperture == GMMU_APERTURE_PEER) && isBar1P2PSupported)
++         {
++             gmmuFieldSetAperture(&pPteFmt->fldAperture, GMMU_APERTURE_SYS_COH, pte.v8);
++         }
++         else
++         {
++             gmmuFieldSetAperture(&pPteFmt->fldAperture, aperture, pte.v8);
++         }
+          nvFieldSet32(&pPteFmt->fldKind, kind, pte.v8);
+ 
+          ptePcfSw |= vol         ? (1 << SW_MMU_PCF_UNCACHED_IDX) : 0;
+@@ -4077,7 +4085,14 @@ nvGpuOpsBuildExternalAllocPtes
+         if (nvFieldIsValid32(&pPteFmt->fldAtomicDisable.desc))
+             nvFieldSetBool(&pPteFmt->fldAtomicDisable, !atomic, pte.v8);
+ 
+-        gmmuFieldSetAperture(&pPteFmt->fldAperture, aperture, pte.v8);
++        if ((aperture == GMMU_APERTURE_PEER) && isBar1P2PSupported)
++        {
++            gmmuFieldSetAperture(&pPteFmt->fldAperture, GMMU_APERTURE_SYS_NONCOH, pte.v8);
++        }
++        else
++        {
++            gmmuFieldSetAperture(&pPteFmt->fldAperture, aperture, pte.v8);
++        }
+ 
+         if (!isCompressedKind)
+         {
+@@ -4088,7 +4103,12 @@ nvGpuOpsBuildExternalAllocPtes
+         }
+     }
+ 
+-    if (aperture == GMMU_APERTURE_PEER)
++    if ((aperture == GMMU_APERTURE_PEER) && isBar1P2PSupported)
++    {
++        fabricBaseAddress = bar1BusAddr;
++    }
++
++    if ((aperture == GMMU_APERTURE_PEER) && !isBar1P2PSupported)
+     {
+         nvFieldSet32(&pPteFmt->fldPeerIndex, peerId, pte.v8);
+ 
+@@ -4347,7 +4367,8 @@ nvGpuOpsBuildExternalAllocPhysAddrs
+     NvBool      isPeerSupported,
+     NvBool      isBar1P2PSupported,
+     NvU32       peerId,
+-    UvmGpuExternalPhysAddrInfo *pGpuExternalPhysAddrInfo
++    UvmGpuExternalPhysAddrInfo *pGpuExternalPhysAddrInfo,
++    RmPhysAddr bar1BusAddr
+ )
+ {
+     NV_STATUS               status              = NV_OK;
+@@ -4425,7 +4446,12 @@ nvGpuOpsBuildExternalAllocPhysAddrs
+         return NV_ERR_BUFFER_TOO_SMALL;
+ 
+ 
+-    if (aperture == GMMU_APERTURE_PEER)
++    if ((aperture == GMMU_APERTURE_PEER) && isBar1P2PSupported)
++    {
++        fabricBaseAddress = bar1BusAddr;
++    }
++
++    if ((aperture == GMMU_APERTURE_PEER) && !isBar1P2PSupported)
+     {
+         //
+         // Any fabric memory descriptors are pre-encoded with the fabric base address
+@@ -4567,6 +4593,7 @@ NV_STATUS nvGpuOpsGetExternalAllocPtesOrPhysAddrs(struct gpuAddressSpace *vaSpac
+     Memory *pMemory = NULL;
+     PMEMORY_DESCRIPTOR pMemDesc = NULL;
+     OBJGPU *pMappingGpu = NULL;
++    RmPhysAddr bar1BusAddr = 0;
+     NvU32 peerId = 0;
+     NvBool isSliSupported = NV_FALSE;
+     NvBool isPeerSupported = NV_FALSE;
+@@ -4706,6 +4733,8 @@ NV_STATUS nvGpuOpsGetExternalAllocPtesOrPhysAddrs(struct gpuAddressSpace *vaSpac
+                                                        &peerId);
+             if (status != NV_OK)
+                 goto freeGpaMemdesc;
++
++            bar1BusAddr = gpumgrGetGpuPhysFbAddr(pAdjustedMemDesc->pGpu);
+         }
+ 
+         //
+@@ -4794,14 +4823,15 @@ NV_STATUS nvGpuOpsGetExternalAllocPtesOrPhysAddrs(struct gpuAddressSpace *vaSpac
+                                                 isPeerSupported,
+                                                 isBar1P2PSupported,
+                                                 peerId,
+-                                                pGpuExternalMappingInfo);
++                                                pGpuExternalMappingInfo,
++                                                bar1BusAddr);
+     }
+ 
+     if (pGpuExternalPhysAddrInfo != NULL)
+     {
+         status = nvGpuOpsBuildExternalAllocPhysAddrs(pVAS, vaSpace->device->session, pMappingGpu, pAdjustedMemDesc,
+                                                      pMemory, offset, size, isIndirectPeerSupported, isPeerSupported,
+-                                                     isBar1P2PSupported, peerId, pGpuExternalPhysAddrInfo);
++                                                     isBar1P2PSupported, peerId, pGpuExternalPhysAddrInfo, bar1BusAddr);
+     }
+ 
+ freeGpaMemdesc:
+@@ -10950,7 +10980,7 @@ NV_STATUS nvGpuOpsGetChannelResourcePtes(struct gpuAddressSpace *vaSpace,
+ 
+     status = nvGpuOpsBuildExternalAllocPtes(pVAS, vaSpace->device->session, pMappingGpu, pMemDesc, NULL,
+                                             offset, size, NV_FALSE, NV_FALSE,
+-                                            NV_FALSE, 0, pGpuExternalMappingInfo);
++                                            NV_FALSE, 0, pGpuExternalMappingInfo, 0);
+ 
+     _nvGpuOpsLocksRelease(&acquiredLocks);
+     threadStateFree(&threadState, THREAD_STATE_FLAGS_NONE);
+-- 
+2.34.1
+

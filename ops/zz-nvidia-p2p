@@ -1,0 +1,86 @@
+#!/bin/bash
+# Recompila o driver NVIDIA com o patch P2P BAR1 para cada kernel novo.
+#
+# Porque existe: o patch vive numa arvore fora do DKMS
+# (/home/eduardopessin/p2p-driver-work/nvidia-595.91.07-p2p). Um upgrade de kernel
+# invalida os .ko pelo vermagic e o DKMS stock reinstala o driver de origem por
+# cima, desligando o P2P em silencio. Aconteceu no salto 5.15.0-187 -> 190 e so
+# se deu por isso tres meses depois.
+#
+# LIMITE CONHECIDO: este hook cobre upgrades de KERNEL, nao de DRIVER. A
+# 2026-09-11 o unattended-upgrades subiu o driver 595.84 -> 595.91.07 e o DKMS
+# sobrescreveu os .ko patched de 190 e 191 com stock. O userspace passou a
+# 595.91 com o modulo carregado ainda em 595.84: "Driver/library version
+# mismatch", e qualquer processo CUDA novo deixou de arrancar (o vLLM so
+# sobreviveu por ter um contexto aberto de antes). Dai a guarda de versao
+# abaixo: se a arvore do patch nao casar com o userspace instalado, NAO se
+# instala nada -- um modulo desemparelhado e pior que um modulo stock.
+#
+# Nao se usa DKMS para isto: o DKMS invoca `make` dentro de kernel-open/ e salta
+# o Makefile de topo que cria o symlink
+#   kernel-open/nvidia/nv-kernel.o_binary -> ../../src/nvidia/_out/Linux_x86_64/nv-kernel.o
+# Sem esse blob de 17.6 MB (o RM com o patch), o link produz um modulo de 18 MB
+# sem P2P em vez dos 33 MB corretos.
+#
+# Corre como postinst.d: $1 = versao do kernel novo.
+set -euo pipefail
+
+KVER="${1:-}"
+SRC=/home/eduardopessin/p2p-driver-work/nvidia-595.91.07-p2p
+DEST="/lib/modules/${KVER}/updates/dkms"
+HEADERS="/usr/src/linux-headers-${KVER}"
+LOG=/var/log/nvidia-p2p-rebuild.log
+# Tamanho do nvidia.ko patched. O stock tem ~18.7 MB; se o build cair para esse
+# valor e porque o nv-kernel.o nao entrou no link.
+MIN_SIZE=30000000
+
+log() { echo "[$(date -Is)] $*" >> "$LOG"; }
+
+[ -n "$KVER" ] || { log "sem versao de kernel em \$1; nada a fazer"; exit 0; }
+[ -d "$SRC" ]  || { log "arvore do patch ausente em $SRC; P2P NAO reconstruido para $KVER"; exit 0; }
+[ -d "$HEADERS" ] || { log "headers ausentes em $HEADERS; P2P NAO reconstruido para $KVER"; exit 0; }
+
+# Guarda de versao: a arvore do patch tem de casar com o userspace instalado.
+# libcuda.so.<versao> e o par obrigatorio do modulo; se divergirem, o CUDA nao
+# inicializa. Preferimos ficar sem P2P (stock coerente) a ficar sem GPU.
+TREE_VER=$(sed -n 's/^NVIDIA_VERSION *= *//p' "$SRC/version.mk" 2>/dev/null | head -1)
+USER_VER=$(ls /usr/lib/x86_64-linux-gnu/libcuda.so.* 2>/dev/null \
+             | grep -v 'so\.1$' | sed 's|.*libcuda\.so\.||' | head -1)
+if [ -z "$TREE_VER" ] || [ -z "$USER_VER" ]; then
+  log "nao consegui determinar versoes (arvore='$TREE_VER' userspace='$USER_VER'); P2P NAO reconstruido para $KVER"
+  exit 0
+fi
+if [ "$TREE_VER" != "$USER_VER" ]; then
+  log "ERRO: arvore do patch em $TREE_VER mas userspace em $USER_VER; P2P NAO reconstruido para $KVER. Portar o patch para $USER_VER (ver /home/eduardopessin/p2p-driver-work)."
+  exit 0
+fi
+
+log "a reconstruir o driver P2P para $KVER (driver $TREE_VER)"
+
+# Os objectos do kernel anterior ficam em cache e o make considera tudo
+# actualizado: limpar so o kernel-open (o src/ e independente do kernel e o
+# nv-kernel.o ja traz o patch RM compilado).
+cd "$SRC/kernel-open"
+rm -f ./*.ko nvidia/*.o nvidia-uvm/*.o nvidia-modeset/*.o nvidia-drm/*.o nvidia-peermem/*.o 2>/dev/null || true
+rm -rf .tmp_versions 2>/dev/null || true
+
+cd "$SRC"
+if ! make modules -j"$(nproc)" SYSSRC="$HEADERS" >> "$LOG" 2>&1; then
+  log "ERRO: a compilacao falhou para $KVER; o P2P vai ficar desligado"
+  exit 0   # nunca abortar o postinst do kernel
+fi
+
+SIZE=$(stat -c '%s' kernel-open/nvidia.ko 2>/dev/null || echo 0)
+if [ "$SIZE" -lt "$MIN_SIZE" ]; then
+  log "ERRO: nvidia.ko com $SIZE bytes (esperado >$MIN_SIZE) — o nv-kernel.o nao entrou no link; NAO instalado"
+  exit 0
+fi
+
+mkdir -p "$DEST"
+install -m 0644 kernel-open/nvidia.ko kernel-open/nvidia-modeset.ko \
+                kernel-open/nvidia-uvm.ko kernel-open/nvidia-drm.ko \
+                kernel-open/nvidia-peermem.ko "$DEST/"
+depmod -a "$KVER"
+
+log "OK: driver P2P instalado para $KVER (nvidia.ko $SIZE bytes, driver $TREE_VER). Activo apos reboot."
+exit 0
