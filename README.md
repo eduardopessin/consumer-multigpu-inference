@@ -11,9 +11,10 @@ This repository documents the driver patch that enables the BAR1 route, the
 operational glue that keeps it in place across kernel and driver upgrades, and
 the evidence that it is active.
 
-No performance comparison is published here. P2P-on versus P2P-off numbers
-have not been measured on this machine under controlled conditions, so no
-speedup is claimed.
+Enabling P2P was observed to speed up tensor-parallel serving on this machine.
+That observation is not yet backed by a published measurement: a controlled
+P2P-on versus P2P-off comparison is pending and will be added here when it is
+run. Treat the speedup as reported, not demonstrated.
 
 ## Current state
 
@@ -48,6 +49,7 @@ Full command output: [`docs/evidence.md`](docs/evidence.md).
 | `ops/check-nvidia-p2p` | Health check: module size on disk plus runtime peer matrix |
 | `bench/cleanbench.py` | Serving benchmark with a contamination gate |
 | `docs/evidence.md` | Raw command output showing P2P active |
+| `docs/performance.md` | The speedup claim, existing data, and the pending measurement |
 | `docs/patch.md` | What the patch changes and why |
 | `docs/operations.md` | Runbook: upgrades, diagnosis, known gaps |
 | `docs/incident-2026-09-11.md` | Post-mortem: driver upgrade silently broke CUDA |
