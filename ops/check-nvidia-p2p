@@ -1,0 +1,56 @@
+#!/bin/bash
+# Verifica se o P2P BAR1 esta activo entre todas as GPUs.
+#
+# Existe porque o P2P ja morreu duas vezes em silencio: um upgrade de kernel
+# invalida os .ko e o DKMS stock reinstala o driver de origem por cima. Da
+# primeira vez passaram tres meses ate alguem reparar.
+#
+# Saida: "OK: ..." + exit 0, ou "FAIL: ..." + exit 1.
+# Pensado para Uptime Kuma (push/exec) ou cron.
+set -uo pipefail
+
+PY=/home/eduardopessin/.venvs/vllm-nightly/bin/python
+MOD=/lib/modules/$(uname -r)/updates/dkms/nvidia.ko
+MIN_SIZE=30000000
+
+# 1. modulo em disco tem de ser o patched (o stock tem ~18.7 MB)
+if [ -f "$MOD" ]; then
+  SIZE=$(stat -c '%s' "$MOD")
+  if [ "$SIZE" -lt "$MIN_SIZE" ]; then
+    echo "FAIL: nvidia.ko em disco tem $SIZE bytes (stock). O patch P2P caiu — correr /etc/kernel/postinst.d/zz-nvidia-p2p $(uname -r)"
+    exit 1
+  fi
+fi
+
+# 2. o que conta: o runtime
+OUT=$("$PY" - <<'EOF' 2>&1
+import sys
+try:
+    import torch
+except Exception as e:
+    print(f"ERR import torch: {e}"); sys.exit(2)
+n = torch.cuda.device_count()
+if n < 2:
+    print(f"ERR apenas {n} GPU(s) visiveis"); sys.exit(2)
+bad = [(i, j) for i in range(n) for j in range(n)
+       if i != j and not torch.cuda.can_device_access_peer(i, j)]
+print(f"{n} {len(bad)}")
+EOF
+)
+RC=$?
+
+if [ $RC -ne 0 ]; then
+  echo "FAIL: nao foi possivel verificar o P2P: $OUT"
+  exit 1
+fi
+
+read -r NGPU NBAD <<< "$OUT"
+TOTAL=$(( NGPU * (NGPU - 1) ))
+
+if [ "$NBAD" -ne 0 ]; then
+  echo "FAIL: P2P inactivo em $NBAD de $TOTAL pares ($NGPU GPUs). Recompilar: sudo /etc/kernel/postinst.d/zz-nvidia-p2p $(uname -r) e recarregar os modulos"
+  exit 1
+fi
+
+echo "OK: P2P BAR1 activo nos $TOTAL pares ($NGPU GPUs), kernel $(uname -r)"
+exit 0

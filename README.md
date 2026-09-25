@@ -5,12 +5,15 @@ and keeping it working across kernel and driver upgrades.
 
 Consumer GeForce drivers ship with no usable GPU-to-GPU P2P path. The mailbox
 route is fused off and the BAR1 route is compiled to stubs that return
-"not supported" on non-datacenter parts. Without P2P, tensor-parallel serving
-falls back to staging every peer transfer through host memory.
+"not supported" on non-datacenter parts.
 
-This repository documents the full stack that makes it work: the driver patch,
-the operational glue that survives unattended upgrades, and a benchmark harness
-that measures the model rather than the queue in front of it.
+This repository documents the driver patch that enables the BAR1 route, the
+operational glue that keeps it in place across kernel and driver upgrades, and
+the evidence that it is active.
+
+No performance comparison is published here. P2P-on versus P2P-off numbers
+have not been measured on this machine under controlled conditions, so no
+speedup is claimed.
 
 ## Current state
 
@@ -28,10 +31,13 @@ $ nvidia-smi topo -p2p rw
 | | |
 |---|---|
 | GPUs | 4x RTX 5060 Ti 16 GB, all `PHB` (same host bridge) |
+| PCIe | Gen3 x8 max per GPU |
 | Driver | 595.91.07 open kernel modules |
 | Kernel | 5.15.0-190-generic (Ubuntu 22.04) |
 | BAR1 | 16384 MiB per GPU, `EnableResizableBar: 1` |
 | P2P | 12/12 ordered pairs OK |
+
+Full command output: [`docs/evidence.md`](docs/evidence.md).
 
 ## Contents
 
@@ -39,7 +45,9 @@ $ nvidia-smi topo -p2p rw
 |---|---|
 | `patches/p2p-bar1-595.91.07.patch` | The driver patch, applies cleanly to upstream tag `595.91.07` |
 | `ops/zz-nvidia-p2p` | Kernel postinst hook that rebuilds the patched modules |
+| `ops/check-nvidia-p2p` | Health check: module size on disk plus runtime peer matrix |
 | `bench/cleanbench.py` | Serving benchmark with a contamination gate |
+| `docs/evidence.md` | Raw command output showing P2P active |
 | `docs/patch.md` | What the patch changes and why |
 | `docs/operations.md` | Runbook: upgrades, diagnosis, known gaps |
 | `docs/incident-2026-09-11.md` | Post-mortem: driver upgrade silently broke CUDA |
